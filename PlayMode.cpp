@@ -12,23 +12,23 @@
 
 #include <random>
 
-GLuint hexapod_meshes_for_lit_color_texture_program = 0;
-Load< MeshBuffer > hexapod_meshes(LoadTagDefault, []() -> MeshBuffer const * {
-	MeshBuffer const *ret = new MeshBuffer(data_path("hexapod.pnct"));
-	hexapod_meshes_for_lit_color_texture_program = ret->make_vao_for_program(lit_color_texture_program->program);
+GLuint game_meshes_for_lit_color_texture_program = 0;
+Load< MeshBuffer > game_meshes(LoadTagDefault, []() -> MeshBuffer const * {
+	MeshBuffer const *ret = new MeshBuffer(data_path("shooting_gallery_meshes.pnct"));
+	game_meshes_for_lit_color_texture_program = ret->make_vao_for_program(lit_color_texture_program->program);
 	return ret;
 });
 
-Load< Scene > hexapod_scene(LoadTagDefault, []() -> Scene const * {
-	return new Scene(data_path("hexapod.scene"), [&](Scene &scene, Scene::Transform *transform, std::string const &mesh_name){
-		Mesh const &mesh = hexapod_meshes->lookup(mesh_name);
+Load< Scene > game_scene(LoadTagDefault, []() -> Scene const * {
+	return new Scene(data_path("shooting_gallery.scene"), [&](Scene &scene, Scene::Transform *transform, std::string const &mesh_name){
+		Mesh const &mesh = game_meshes->lookup(mesh_name);
 
 		scene.drawables.emplace_back(transform);
 		Scene::Drawable &drawable = scene.drawables.back();
 
 		drawable.pipeline = lit_color_texture_program_pipeline;
 
-		drawable.pipeline.vao = hexapod_meshes_for_lit_color_texture_program;
+		drawable.pipeline.vao = game_meshes_for_lit_color_texture_program;
 		drawable.pipeline.type = mesh.type;
 		drawable.pipeline.start = mesh.start;
 		drawable.pipeline.count = mesh.count;
@@ -36,24 +36,36 @@ Load< Scene > hexapod_scene(LoadTagDefault, []() -> Scene const * {
 	});
 });
 
-PlayMode::PlayMode() : scene(*hexapod_scene) {
-	//get pointers to leg for convenience:
-	for (auto &transform : scene.transforms) {
-		if (transform.name == "Hip.FL") hip = &transform;
-		else if (transform.name == "UpperLeg.FL") upper_leg = &transform;
-		else if (transform.name == "LowerLeg.FL") lower_leg = &transform;
-	}
-	if (hip == nullptr) throw std::runtime_error("Hip not found.");
-	if (upper_leg == nullptr) throw std::runtime_error("Upper leg not found.");
-	if (lower_leg == nullptr) throw std::runtime_error("Lower leg not found.");
+PlayMode::PlayMode() : scene(*game_scene) {
 
-	hip_base_rotation = hip->rotation;
-	upper_leg_base_rotation = upper_leg->rotation;
-	lower_leg_base_rotation = lower_leg->rotation;
+	for (auto &transform : scene.transforms){
+		// Get pointers to targets
+		if (transform.name.find("Target") != std::string::npos){
+			Target found_target = Target(&transform);
+			// found_target.collider.transform->position += glm::vec3(0.0f, 0.0f, 5.0f); // shif
+			targets.emplace_back(Target(&transform));
+		}
+
+		// Get pointer to cannon
+		if (transform.name.find("Cannon") != std::string::npos){
+			cannon = &transform;
+		}
+	}
+
+	health_points = 3;
+	targets_left = targets.size();
+	
+	cannon_base_rotation = cannon->rotation;
 
 	//get pointer to camera for convenience:
 	if (scene.cameras.size() != 1) throw std::runtime_error("Expecting scene to have exactly one camera, but it has " + std::to_string(scene.cameras.size()));
 	camera = &scene.cameras.front();
+	
+	camera->transform->position -= glm::vec3(-12.0f, 0.0f, 0.0f);
+
+	player_collider = SphereCollider(camera->transform, 2.0f);
+
+	current_game_state = GameState::Play;
 }
 
 PlayMode::~PlayMode() {
@@ -81,6 +93,17 @@ bool PlayMode::handle_event(SDL_Event const &evt, glm::uvec2 const &window_size)
 			down.downs += 1;
 			down.pressed = true;
 			return true;
+		} else if (evt.key.key == SDLK_RETURN){
+			enter.downs += 1;
+			enter.pressed = true;
+			if (current_game_state != GameState::Play) return true;
+			
+			glm::vec3 spawn_position = camera->transform->make_world_from_local() * glm::vec4(0.0f, 0.0f, -5.0f, 1.0f);
+			glm::mat4x3 frame = camera->transform->make_parent_from_local();
+			glm::vec3 direction = -frame[2]; // get camera's forward
+
+			spawn_projectile(spawn_position, direction, player_projectile_speed);
+			return true;
 		}
 	} else if (evt.type == SDL_EVENT_KEY_UP) {
 		if (evt.key.key == SDLK_A) {
@@ -94,6 +117,9 @@ bool PlayMode::handle_event(SDL_Event const &evt, glm::uvec2 const &window_size)
 			return true;
 		} else if (evt.key.key == SDLK_S) {
 			down.pressed = false;
+			return true;
+		} else if (evt.key.key == SDLK_RETURN){
+			enter.pressed = false;
 			return true;
 		}
 	} else if (evt.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
@@ -121,28 +147,78 @@ bool PlayMode::handle_event(SDL_Event const &evt, glm::uvec2 const &window_size)
 
 void PlayMode::update(float elapsed) {
 
-	//slowly rotates through [0,1):
-	wobble += elapsed / 10.0f;
-	wobble -= std::floor(wobble);
+	// move projectile
+	{
+		if (current_projectile.active)
+		{
+			current_projectile.velocity.z += gravity * elapsed;
+			current_projectile.transform->position += current_projectile.velocity * elapsed;
 
-	hip->rotation = hip_base_rotation * glm::angleAxis(
-		glm::radians(5.0f * std::sin(wobble * 2.0f * float(M_PI))),
-		glm::vec3(0.0f, 1.0f, 0.0f)
-	);
-	upper_leg->rotation = upper_leg_base_rotation * glm::angleAxis(
-		glm::radians(7.0f * std::sin(wobble * 2.0f * 2.0f * float(M_PI))),
-		glm::vec3(0.0f, 0.0f, 1.0f)
-	);
-	lower_leg->rotation = lower_leg_base_rotation * glm::angleAxis(
-		glm::radians(10.0f * std::sin(wobble * 3.0f * 2.0f * float(M_PI))),
-		glm::vec3(0.0f, 0.0f, 1.0f)
-	);
+		}
+	}
 
+	// check for collision (sphere vs sphere)
+	// based on https://www.swiftless.com/tutorials/opengl/collision.html
+	{
+		if (current_projectile.active){
+			// check target collision
+			for (Target& target : targets){
+				
+				if (!target.active) continue;
+
+				// calculate distance between two points
+				// sphere collider for target needs to be shifted up for proper collision
+				float collider_offset = 5.0f;
+				float distance = std::sqrt(
+					((current_projectile.transform->position.x - target.transform->position.x) *
+					(current_projectile.transform->position.x - target.transform->position.x)) +
+
+					((current_projectile.transform->position.y - target.transform->position.y) *
+					(current_projectile.transform->position.y - target.transform->position.y)) +
+
+					((current_projectile.transform->position.z - (target.transform->position.z + collider_offset)) * 
+					(current_projectile.transform->position.z - (target.transform->position.z + collider_offset)))
+				);
+
+				if (distance <= current_projectile.collider.radius + target.collider.radius){
+					handle_target_collision(target);
+				}
+
+			
+			}
+
+			// check player collision
+			float distance = std::sqrt(
+					((current_projectile.transform->position.x - player_collider.transform->position.x) *
+					(current_projectile.transform->position.x - player_collider.transform->position.x)) +
+
+					((current_projectile.transform->position.y - player_collider.transform->position.y) *
+					(current_projectile.transform->position.y - player_collider.transform->position.y)) +
+
+					((current_projectile.transform->position.z - player_collider.transform->position.z) * 
+					(current_projectile.transform->position.z - player_collider.transform->position.z))
+				);
+
+			if (distance <= current_projectile.collider.radius + player_collider.radius){
+					handle_player_collision();
+				}
+		}
+
+	}
+
+	// update projectile's life
+	{
+		current_projectile.lifetime -= elapsed;
+		if (current_projectile.lifetime <= 0.0f){
+			destroy_projectile();
+		}
+	}
+	
 	//move camera:
 	{
 
 		//combine inputs into a move:
-		constexpr float PlayerSpeed = 30.0f;
+		constexpr float PlayerSpeed = 0.0f;
 		glm::vec2 move = glm::vec2(0.0f);
 		if (left.pressed && !right.pressed) move.x =-1.0f;
 		if (!left.pressed && right.pressed) move.x = 1.0f;
@@ -158,6 +234,22 @@ void PlayMode::update(float elapsed) {
 		glm::vec3 frame_forward = -frame[2];
 
 		camera->transform->position += move.x * frame_right + move.y * frame_forward;
+	}
+
+
+	// check game state
+	{
+		if (targets_left <= 0)
+		{
+			game_state_message = "YOU WIN!";
+			current_game_state = GameState::PostRound;
+		}
+
+		if (health_points <= 0)
+		{
+			game_state_message = "YOU LOSE!";
+			current_game_state = GameState::PostRound;
+		}
 	}
 
 	//reset button press counters:
@@ -201,14 +293,111 @@ void PlayMode::draw(glm::uvec2 const &drawable_size) {
 		));
 
 		constexpr float H = 0.09f;
-		lines.draw_text("Mouse motion rotates camera; WASD moves; escape ungrabs mouse",
-			glm::vec3(-aspect + 0.1f * H, -1.0 + 0.1f * H, 0.0),
-			glm::vec3(H, 0.0f, 0.0f), glm::vec3(0.0f, H, 0.0f),
-			glm::u8vec4(0x00, 0x00, 0x00, 0x00));
 		float ofs = 2.0f / drawable_size.y;
-		lines.draw_text("Mouse motion rotates camera; WASD moves; escape ungrabs mouse",
+		lines.draw_text("Mouse motion rotates camera;escape ungrabs mouse",
 			glm::vec3(-aspect + 0.1f * H + ofs, -1.0 + 0.1f * H + ofs, 0.0),
 			glm::vec3(H, 0.0f, 0.0f), glm::vec3(0.0f, H, 0.0f),
 			glm::u8vec4(0xff, 0xff, 0xff, 0x00));
+		
+		// Health Points
+		lines.draw_text("Health Points ",
+			glm::vec3(-aspect + 0.1f * H + ofs, 0.85f, 0.0),
+			glm::vec3(H, 0.0f, 0.0f), glm::vec3(0.0f, H, 0.0f),
+			glm::u8vec4(0xff, 0xff, 0xff, 0x00));
+
+		lines.draw_text(std::to_string(health_points),
+			glm::vec3(-aspect + 0.1f * H + ofs + 0.5, 0.85f, 0.0),
+			glm::vec3(H, 0.0f, 0.0f), glm::vec3(0.0f, H, 0.0f),
+			glm::u8vec4(0xff, 0xff, 0xff, 0x00));
+
+		
+		// Game State Message
+		lines.draw_text(game_state_message,
+			glm::vec3(-0.15f, 0.0f, 0.0f),
+			glm::vec3(H, 0.0f, 0.0f), glm::vec3(0.0f, H, 0.0f),
+			glm::u8vec4(0xff, 0xff, 0xff, 0x00));
 	}
+}
+
+// based on 15-466 Lecture 4 Add to Scene Graph Example
+void PlayMode::spawn_projectile(glm::vec3 spawn_position, glm::vec3 direction, float speed)
+{
+	scene.transforms.emplace_back();
+	current_projectile = Projectile(&scene.transforms.back());
+
+	current_projectile.transform->position = spawn_position;
+	current_projectile.velocity = speed * direction;
+	current_projectile.active = true;
+
+
+	Mesh const &projectile_mesh = game_meshes->lookup("Sphere");
+	scene.drawables.emplace_back(current_projectile.transform);
+	Scene::Drawable &drawable = scene.drawables.back();
+
+	drawable.pipeline = lit_color_texture_program_pipeline;
+	drawable.pipeline.vao = game_meshes_for_lit_color_texture_program;
+	drawable.pipeline.type = projectile_mesh.type;
+	drawable.pipeline.start = projectile_mesh.start;
+	drawable.pipeline.count = projectile_mesh.count;
+
+	current_game_state = GameState::MidRound;
+}
+
+// based on 15-466 Lecture 4 Remove from Scene Graph Example
+void PlayMode::destroy_projectile()
+{
+	current_projectile.active = false;
+
+	// clean up drawable
+	for (std::list<Scene::Drawable>::iterator di = scene.drawables.begin(); di != scene.drawables.end();){
+		if (di->transform == current_projectile.transform){
+			di = scene.drawables.erase(di);
+		} else {
+			di++;
+		}
+	}
+
+	// player missed
+	if (current_game_state == GameState::MidRound){
+		shoot_player();
+	}
+}
+
+void PlayMode::handle_target_collision(Target& target)
+{
+	// Update Game State
+	current_game_state = GameState::Play;
+	targets_left--;
+	
+	// Remove Projectile
+	current_projectile.active = false;
+	destroy_projectile();
+
+	// Deactivate Target
+	target.transform->rotation = glm::angleAxis(glm::radians(-90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+	target.active = false;
+}
+
+void PlayMode::handle_player_collision()
+{
+	// Update GameState
+	current_game_state = GameState::Play;
+	health_points--;
+	
+	// Remove Projectile
+	current_projectile.active = false;
+	destroy_projectile();
+
+	// Reset Cannon Rotation
+	cannon->rotation = cannon_base_rotation;
+}
+
+void PlayMode::shoot_player()
+{
+	cannon->rotation = cannon_target_rotation;
+
+	glm::mat4x3 cannon_matrix = cannon->make_parent_from_local();
+	glm::vec3 direction = cannon_matrix[2];
+
+	spawn_projectile(cannon->position, direction, cannon_projectile_speed);
 }
